@@ -1,3 +1,106 @@
+# ------------------------------------------------------------------
+#  NEW IMPORTS for the OR-Tools engine
+# ------------------------------------------------------------------
+from concurrent.futures import ThreadPoolExecutor
+from ortools.sat.python import cp_model
+import datetime as _dt
+from dateutil import parser as _dp
+
+import json
+import requests
+from datetime import datetime, timedelta
+import re
+from typing import Dict, List, Tuple, Optional
+from dateutil import parser as date_parser
+import pytz
+
+IST = pytz.timezone('Asia/Kolkata')
+SEARCH_D = 7                 # look ahead 7 calendar days
+DUR_STEP = 15                # granularity for candidate slots (minutes)
+WORKDAY = (9, 18)            # working hours 09:00–18:00 IST
+
+
+# ------------------------------------------------------------------
+#  OR-TOOLS SLOT FINDER
+# ------------------------------------------------------------------
+def _events(email: str, start_date: str, end_date: str) -> List[dict]:
+    """
+    Thin wrapper so the OR-Tools layer can reuse the existing
+    AgenticScheduler().get_calendar_events method.
+    """
+    return AgenticScheduler().get_calendar_events(email, start_date, end_date)
+
+
+def _busy(events: List[dict]) -> List[Tuple[_dt.datetime, _dt.datetime]]:
+    """
+    Convert Google-formatted events into simple datetime tuples.
+    """
+    busy = []
+    for ev in events:
+        start = _dp.parse(ev["StartTime"]).astimezone(IST)
+        end   = _dp.parse(ev["EndTime"]).astimezone(IST)
+        busy.append((start, end))
+    return busy
+
+
+def _optimal(attendees: List[str], dur: int, start_date: str) -> Tuple[str, str]:
+    """
+    Use OR-Tools CP-SAT to pick the earliest *optimal* slot
+    that respects everyone’s existing calendar.
+    Falls back to greedy if the solver times out or no model found.
+    """
+    base = _dt.datetime.combine(_dp.parse(start_date).date(), _dt.time(9, 0, tzinfo=IST))
+    duration = _dt.timedelta(minutes=dur)
+    busy = []
+
+    # --- Fetch all calendars in parallel -----------------------------
+    with ThreadPoolExecutor() as ex:
+        for ev_list in ex.map(
+            lambda u: _events(u, base.date().isoformat(),
+                              (base + _dt.timedelta(days=SEARCH_D)).date().isoformat()),
+            attendees
+        ):
+            busy.extend(_busy(ev_list))
+
+    # --- Build candidate slots (Mon–Fri, 09:00–18:00) ---------------
+    slots = []
+    cur = base
+    while cur + duration <= base + _dt.timedelta(days=SEARCH_D):
+        if cur.weekday() < 5 and WORKDAY[0] <= cur.hour < WORKDAY[1]:
+            slots.append((cur, cur + duration))
+        cur += _dt.timedelta(minutes=DUR_STEP)
+
+    # --- CP-SAT model ----------------------------------------------
+    if slots:
+        mdl = cp_model.CpModel()
+        x = [mdl.NewBoolVar(f's{i}') for i in range(len(slots))]
+        mdl.Add(sum(x) == 1)               # choose exactly one slot
+
+        for i, (s, e) in enumerate(slots):
+            # forbid if it overlaps any busy interval
+            if any(s < b[1] and e > b[0] for b in busy):
+                mdl.Add(x[i] == 0)
+
+        # objective: earliest start time
+        mdl.Minimize(sum(x[i] * int(s.timestamp()) for i, (s, _) in enumerate(slots)))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 0.5
+        if solver.Solve(mdl) == cp_model.OPTIMAL:
+            idx = next(i for i, b in enumerate(x) if solver.Value(b))
+            return slots[idx][0].isoformat(), slots[idx][1].isoformat()
+
+    # --- Greedy fallback -------------------------------------------
+    for s, e in slots:
+        if not any(s < b[1] and e > b[0] for b in busy):
+            return s.isoformat(), e.isoformat()
+
+    # --- Ultimate fallback -----------------------------------------
+    fb = base + _dt.timedelta(days=1, hours=1, minutes=30)
+    return fb.isoformat(), (fb + duration).isoformat()
+
+
+
 """
 Agentic AI Scheduling Assistant
 AMD Hackathon Solution
@@ -9,13 +112,7 @@ This module implements an intelligent scheduling system that:
 4. Returns structured JSON output
 """
 
-import json
-import requests
-from datetime import datetime, timedelta
-import re
-from typing import Dict, List, Tuple, Optional
-from dateutil import parser as date_parser
-import pytz
+
 
 # Google Calendar API imports
 try:
@@ -275,69 +372,18 @@ class AgenticScheduler:
         }
         
         return mock_events.get(email, [])
-    
-    def find_optimal_slot(self, attendees: List[str], duration_minutes: int, 
-                         time_preference: str, start_date: str) -> Tuple[str, str]:
+
+    def find_optimal_slot(self,
+                          attendees: List[str],
+                          duration_minutes: int,
+                          time_preference: str,   # kept for signature compatibility
+                          start_date: str) -> Tuple[str, str]:
         """
-        Find optimal meeting slot for all attendees
-        
-        Args:
-            attendees: List of attendee emails
-            duration_minutes: Meeting duration in minutes
-            time_preference: Preferred time or "flexible"
-            start_date: Date to start searching from
-            
-        Returns:
-            Tuple of (start_time, end_time) in ISO format
+        Public wrapper that simply delegates to the OR-Tools engine.
+        Any day-of-week preference can be post-processed if desired,
+        but the current implementation already skips weekends.
         """
-        # Parse start date
-        base_date = date_parser.parse(start_date).date()
-        
-        # Define working hours (9 AM to 6 PM IST)
-        working_start = 9
-        working_end = 18
-        
-        # Get all attendees' calendars
-        all_events = {}
-        for attendee in attendees:
-            events = self.get_calendar_events(
-                attendee, 
-                base_date.isoformat(), 
-                (base_date + timedelta(days=7)).isoformat()
-            )
-            all_events[attendee] = events
-        
-        # Try to find slot for next 7 days
-        for day_offset in range(7):
-            search_date = base_date + timedelta(days=day_offset)
-            
-            # Skip weekends unless specified
-            if search_date.weekday() >= 5 and time_preference == "flexible":
-                continue
-            
-            # Check if this matches time preference
-            if time_preference != "flexible":
-                day_name = search_date.strftime('%A').lower()
-                if time_preference.lower() not in day_name:
-                    continue
-            
-            # Find free slots for this day
-            optimal_slot = self._find_day_slot(
-                all_events, search_date, duration_minutes, 
-                working_start, working_end
-            )
-            
-            if optimal_slot:
-                return optimal_slot
-        
-        # Fallback: return a slot anyway
-        fallback_date = base_date + timedelta(days=1)
-        start_time = self.timezone.localize(
-            datetime.combine(fallback_date, datetime.min.time().replace(hour=10, minute=30))
-        )
-        end_time = start_time + timedelta(minutes=duration_minutes)
-        
-        return start_time.isoformat(), end_time.isoformat()
+        return _optimal(attendees, duration_minutes, start_date)
     
     def _find_day_slot(self, all_events: Dict, search_date, duration_minutes: int,
                       working_start: int, working_end: int) -> Optional[Tuple[str, str]]:
