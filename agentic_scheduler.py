@@ -557,8 +557,15 @@ JSON:"""
             
             # Define time slots (15-minute granularity for precision)
             SLOT_DURATION = 15  # minutes
-            SLOTS_PER_DAY = (24 * 60) // SLOT_DURATION  # 96 slots per day
+            BUSINESS_START_HOUR = 9  # 9 AM
+            BUSINESS_END_HOUR = 18   # 6 PM
+            
+            # Calculate slots only for business hours to avoid hour > 23 errors
+            BUSINESS_HOURS = BUSINESS_END_HOUR - BUSINESS_START_HOUR  # 9 hours
+            SLOTS_PER_DAY = (BUSINESS_HOURS * 60) // SLOT_DURATION  # 36 slots (9 hours * 4 slots/hour)
             DAYS_TO_SEARCH = 7
+            
+            print(f"🔧 OR-Tools setup: {SLOTS_PER_DAY} slots/day, {DAYS_TO_SEARCH} days")
             
             # Time preference mapping
             preference_weights = self._get_time_preference_weights(time_preference)
@@ -594,7 +601,7 @@ JSON:"""
                 for slot in range(SLOTS_PER_DAY - slots_needed + 1):
                     # Check if this slot conflicts with any attendee's calendar
                     has_conflict = self._check_slot_conflicts(
-                        all_events, current_date, slot, slots_needed, SLOT_DURATION
+                        all_events, current_date, slot, slots_needed, SLOT_DURATION, BUSINESS_START_HOUR
                     )
                     
                     if has_conflict:
@@ -629,19 +636,33 @@ JSON:"""
                 for day in range(DAYS_TO_SEARCH):
                     for slot in range(SLOTS_PER_DAY):
                         if solver.Value(meeting_slot[day][slot]) == 1:
-                            # Convert back to datetime
+                            # Convert back to datetime with business hours offset
                             selected_date = search_date + timedelta(days=day)
-                            start_minutes = slot * SLOT_DURATION
-                            start_hour = start_minutes // 60
-                            start_min = start_minutes % 60
                             
-                            start_time = self.timezone.localize(
-                                datetime.combine(selected_date, time(start_hour, start_min))
-                            )
-                            end_time = start_time + timedelta(minutes=duration_minutes)
+                            # Calculate actual time considering business hours start
+                            slot_minutes_from_business_start = slot * SLOT_DURATION
+                            actual_hour = BUSINESS_START_HOUR + (slot_minutes_from_business_start // 60)
+                            actual_minute = slot_minutes_from_business_start % 60
                             
-                            print(f"✅ OR-Tools found optimal slot: {start_time}")
-                            return start_time.isoformat(), end_time.isoformat()
+                            # Validate hour is within business hours and valid range
+                            if actual_hour >= BUSINESS_END_HOUR or actual_hour >= 24:
+                                print(f"⚠️ Invalid hour calculated: {actual_hour}, using fallback")
+                                return self._heuristic_fallback(attendees, duration_minutes, time_preference, start_date)
+                            
+                            # Ensure minute is within valid range
+                            actual_minute = min(actual_minute, 59)
+                            
+                            try:
+                                start_time = self.timezone.localize(
+                                    datetime.combine(selected_date, time(actual_hour, actual_minute))
+                                )
+                                end_time = start_time + timedelta(minutes=duration_minutes)
+                                
+                                print(f"✅ OR-Tools found optimal slot: {start_time}")
+                                return start_time.isoformat(), end_time.isoformat()
+                            except ValueError as ve:
+                                print(f"⚠️ Time creation error: {ve}, using fallback")
+                                return self._heuristic_fallback(attendees, duration_minutes, time_preference, start_date)
             
             print("⚠️ OR-Tools couldn't find optimal solution, using heuristic fallback")
             return self._heuristic_fallback(attendees, duration_minutes, time_preference, start_date)
@@ -651,43 +672,67 @@ JSON:"""
             return self._find_optimal_slot_traditional(attendees, duration_minutes, time_preference, start_date)
     
     def _get_time_preference_weights(self, time_preference: str) -> Dict[int, int]:
-        """Get optimization weights based on time preference."""
+        """Get optimization weights based on time preference (business hours 9 AM - 6 PM)."""
         weights = {}
         SLOT_DURATION = 15
+        BUSINESS_START_HOUR = 9
         
         if time_preference == "morning":
-            # Weight morning slots (9 AM - 12 PM) higher
+            # Weight morning slots (9 AM - 12 PM) higher - slots 0-11
             for hour in range(9, 12):
                 for min_slot in range(0, 60, SLOT_DURATION):
-                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    # Convert to business hours slot (offset by 9 AM)
+                    slot = (((hour - BUSINESS_START_HOUR) * 60) + min_slot) // SLOT_DURATION
                     weights[slot] = 10
         elif time_preference == "afternoon":
-            # Weight afternoon slots (12 PM - 5 PM) higher
+            # Weight afternoon slots (12 PM - 5 PM) higher - slots 12-31
             for hour in range(12, 17):
                 for min_slot in range(0, 60, SLOT_DURATION):
-                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    # Convert to business hours slot (offset by 9 AM)
+                    slot = (((hour - BUSINESS_START_HOUR) * 60) + min_slot) // SLOT_DURATION
                     weights[slot] = 10
         elif time_preference == "evening":
-            # Weight late afternoon/early evening (4 PM - 6 PM) higher
+            # Weight late afternoon/early evening (4 PM - 6 PM) higher - slots 28-35
             for hour in range(16, 18):
                 for min_slot in range(0, 60, SLOT_DURATION):
-                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    # Convert to business hours slot (offset by 9 AM)
+                    slot = (((hour - BUSINESS_START_HOUR) * 60) + min_slot) // SLOT_DURATION
                     weights[slot] = 10
         
         return weights
     
     def _check_slot_conflicts(self, all_events: Dict, date: datetime, 
-                             start_slot: int, slots_needed: int, slot_duration: int) -> bool:
+                             start_slot: int, slots_needed: int, slot_duration: int, 
+                             business_start_hour: int = 9) -> bool:
         """Check if a time slot conflicts with existing meetings."""
-        start_minutes = start_slot * slot_duration
-        end_minutes = (start_slot + slots_needed) * slot_duration
         
-        slot_start = self.timezone.localize(
-            datetime.combine(date, time(start_minutes // 60, start_minutes % 60))
-        )
-        slot_end = self.timezone.localize(
-            datetime.combine(date, time(end_minutes // 60, end_minutes % 60))
-        )
+        # Calculate actual time considering business hours offset
+        slot_minutes_from_business_start = start_slot * slot_duration
+        start_hour = business_start_hour + (slot_minutes_from_business_start // 60)
+        start_min = slot_minutes_from_business_start % 60
+        
+        end_slot_minutes = (start_slot + slots_needed) * slot_duration
+        end_hour = business_start_hour + (end_slot_minutes // 60)
+        end_min = end_slot_minutes % 60
+        
+        # Skip if hours are invalid (beyond business hours or 24-hour format)
+        if start_hour >= 24 or end_hour >= 24 or start_hour >= 18 or end_hour >= 18:
+            return True  # Treat as conflict to avoid the slot
+        
+        # Ensure minutes are within valid range
+        start_min = min(start_min, 59)
+        end_min = min(end_min, 59)
+        
+        try:
+            slot_start = self.timezone.localize(
+                datetime.combine(date, time(start_hour, start_min))
+            )
+            slot_end = self.timezone.localize(
+                datetime.combine(date, time(end_hour, end_min))
+            )
+        except ValueError:
+            # If time creation fails, treat as conflict
+            return True
         
         for attendee, events in all_events.items():
             for event in events:
