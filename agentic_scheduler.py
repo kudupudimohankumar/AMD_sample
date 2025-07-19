@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from ortools.sat.python import cp_model
 import datetime as _dt
 from dateutil import parser as _dp
+import asyncio
+import traceback
 
 import json
 import requests
@@ -37,8 +39,20 @@ def _busy(events: List[dict]) -> List[Tuple[_dt.datetime, _dt.datetime]]:
     """
     busy = []
     for ev in events:
-        start = _dp.parse(ev["StartTime"]).astimezone(IST)
-        end   = _dp.parse(ev["EndTime"]).astimezone(IST)
+        start = _dp.parse(ev["StartTime"])
+        end = _dp.parse(ev["EndTime"])
+        
+        # Ensure timezone-aware datetimes
+        if start.tzinfo is None:
+            start = IST.localize(start)
+        else:
+            start = start.astimezone(IST)
+            
+        if end.tzinfo is None:
+            end = IST.localize(end)
+        else:
+            end = end.astimezone(IST)
+            
         busy.append((start, end))
     return busy
 
@@ -222,7 +236,7 @@ class AgenticScheduler:
     
     def _extract_meeting_info_with_agent(self, email_content: str) -> Dict[str, Any]:
         """
-        Extract meeting information using Agentic AI with MCP tools.
+        Extract meeting information using Pydantic AI agents with MCP tools.
         
         Args:
             email_content: Raw email content
@@ -234,95 +248,405 @@ class AgenticScheduler:
             return self._extract_meeting_info_traditional(email_content)
         
         try:
-            from pydantic_ai import Agent
+            from pydantic_ai import Agent, Tool
+            from pydantic_ai.mcp import MCPServerStdio
             from pydantic import BaseModel
-            from typing import Optional
+            from typing import Optional, List
+            import asyncio
+            from datetime import datetime, timedelta
+            import re
             
             class MeetingInfo(BaseModel):
                 meeting_duration_minutes: int
                 time_preference: str  # morning, afternoon, evening, anytime
                 urgency: str  # high, medium, low
-                meeting_type: str  # team_meeting, client_call, interview, presentation
+                meeting_type: str  # team_meeting, client_call, interview, presentation, other
                 preferred_date: Optional[str] = None
                 attendees_count: Optional[int] = None
                 location_preference: Optional[str] = None
                 recurring: bool = False
+                subject_keywords: Optional[List[str]] = None
             
-            # Create specialized extraction agent
+            # Define MCP servers for enhanced extraction
+            time_server = MCPServerStdio(
+                "python",
+                args=["-m", "mcp_server_time", "--local-timezone=Asia/Kolkata"],
+            )
+            
+            # Define extraction tools
+            @Tool
+            def extract_duration_from_text(text: str) -> Dict[str, Any]:
+                """Extract meeting duration from text using pattern matching."""
+                duration_patterns = [
+                    (r'(\d+)\s*hours?', lambda x: int(x) * 60),
+                    (r'(\d+)\s*hrs?', lambda x: int(x) * 60),
+                    (r'(\d+)\s*minutes?', lambda x: int(x)),
+                    (r'(\d+)\s*mins?', lambda x: int(x)),
+                    (r'half\s*hour', lambda x: 30),
+                    (r'quarter\s*hour', lambda x: 15),
+                    (r'1\.5\s*hours?', lambda x: 90),
+                    (r'two\s*hours?', lambda x: 120),
+                    (r'one\s*hour', lambda x: 60),
+                ]
+                
+                for pattern, converter in duration_patterns:
+                    match = re.search(pattern, text.lower())
+                    if match:
+                        if pattern in [r'half\s*hour', r'quarter\s*hour', r'1\.5\s*hours?', r'two\s*hours?', r'one\s*hour']:
+                            return {"duration": converter(None), "confidence": "high"}
+                        else:
+                            return {"duration": converter(match.group(1)), "confidence": "high"}
+                
+                # Default duration based on meeting type keywords
+                if any(word in text.lower() for word in ['standup', 'daily', 'scrum']):
+                    return {"duration": 15, "confidence": "medium"}
+                elif any(word in text.lower() for word in ['interview', 'presentation']):
+                    return {"duration": 45, "confidence": "medium"}
+                elif any(word in text.lower() for word in ['workshop', 'training']):
+                    return {"duration": 120, "confidence": "medium"}
+                
+                return {"duration": 60, "confidence": "low"}  # Default
+            
+            @Tool
+            def extract_time_preference(text: str) -> Dict[str, str]:
+                """Extract time preferences from meeting text."""
+                text_lower = text.lower()
+                
+                # Morning indicators
+                if any(word in text_lower for word in ['morning', 'am', '9am', '10am', '11am', 'early']):
+                    return {"preference": "morning", "confidence": "high"}
+                
+                # Afternoon indicators
+                elif any(word in text_lower for word in ['afternoon', 'pm', '1pm', '2pm', '3pm', '4pm', 'lunch']):
+                    return {"preference": "afternoon", "confidence": "high"}
+                
+                # Evening indicators
+                elif any(word in text_lower for word in ['evening', '5pm', '6pm', 'eod', 'end of day']):
+                    return {"preference": "evening", "confidence": "high"}
+                
+                # Specific day preferences
+                days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                for day in days:
+                    if day in text_lower:
+                        return {"preference": day, "confidence": "high"}
+                
+                # Time flexibility indicators
+                if any(word in text_lower for word in ['flexible', 'anytime', 'convenient', 'whenever']):
+                    return {"preference": "anytime", "confidence": "medium"}
+                
+                return {"preference": "anytime", "confidence": "low"}
+            
+            @Tool
+            def extract_urgency_level(text: str) -> Dict[str, str]:
+                """Extract urgency level from meeting text."""
+                text_lower = text.lower()
+                
+                # High urgency indicators
+                if any(word in text_lower for word in ['urgent', 'asap', 'immediately', 'emergency', 'critical']):
+                    return {"urgency": "high", "confidence": "high"}
+                
+                # Medium urgency indicators
+                elif any(word in text_lower for word in ['soon', 'this week', 'priority', 'important']):
+                    return {"urgency": "medium", "confidence": "high"}
+                
+                # Low urgency indicators
+                elif any(word in text_lower for word in ['flexible', 'whenever', 'no rush', 'convenient']):
+                    return {"urgency": "low", "confidence": "high"}
+                
+                return {"urgency": "medium", "confidence": "medium"}  # Default
+            
+            @Tool
+            def extract_meeting_type(text: str) -> Dict[str, str]:
+                """Extract meeting type from content."""
+                text_lower = text.lower()
+                
+                # Team meeting indicators
+                if any(word in text_lower for word in ['team', 'standup', 'scrum', 'sprint', 'retrospective']):
+                    return {"type": "team_meeting", "confidence": "high"}
+                
+                # Client call indicators
+                elif any(word in text_lower for word in ['client', 'customer', 'external', 'demo', 'sales']):
+                    return {"type": "client_call", "confidence": "high"}
+                
+                # Interview indicators
+                elif any(word in text_lower for word in ['interview', 'candidate', 'hiring', 'screening']):
+                    return {"type": "interview", "confidence": "high"}
+                
+                # Presentation indicators
+                elif any(word in text_lower for word in ['presentation', 'demo', 'showcase', 'review']):
+                    return {"type": "presentation", "confidence": "high"}
+                
+                # Planning indicators
+                elif any(word in text_lower for word in ['planning', 'strategy', 'roadmap', 'brainstorm']):
+                    return {"type": "planning", "confidence": "high"}
+                
+                return {"type": "other", "confidence": "medium"}
+            
+            # Create the specialized extraction agent
             extraction_agent = Agent(
                 model=self.agent_model,
                 result_type=MeetingInfo,
-                system_prompt="""You are an expert meeting information extraction agent.
+                mcp_servers=[time_server],
+                tools=[extract_duration_from_text, extract_time_preference, extract_urgency_level, extract_meeting_type],
+                system_prompt="""You are an expert meeting information extraction agent with access to specialized tools.
 
-Extract these key parameters from email content:
-1. meeting_duration_minutes: Estimate duration (default 60 if not specified)
-2. time_preference: morning (6-12), afternoon (12-17), evening (17-21), anytime
-3. urgency: high (ASAP, urgent), medium (this week), low (flexible)
-4. meeting_type: team_meeting, client_call, interview, presentation, other
+Your task is to analyze email content and extract meeting parameters accurately.
 
-Analyze the context, tone, and explicit requirements carefully.
-Be precise and practical in your extractions."""
+Use the available tools to:
+1. extract_duration_from_text: Get meeting duration from text
+2. extract_time_preference: Determine preferred meeting time
+3. extract_urgency_level: Assess meeting urgency
+4. extract_meeting_type: Classify the meeting type
+5. get_current_time: Get current date/time for context
+
+Process the email content systematically:
+- First, call get_current_time to understand the current context
+- Then use each extraction tool to gather specific information
+- Synthesize the results into a comprehensive MeetingInfo object
+- Ensure all extracted values are realistic and consistent
+
+Be thorough and precise in your analysis."""
             )
             
             # Run extraction with the agent
-            result = extraction_agent.run_sync(
-                f"Extract meeting information from this email:\n\n{email_content}"
-            )
+            async def run_extraction():
+                async with extraction_agent.run_mcp_servers():
+                    result = await extraction_agent.run(
+                        f"Extract comprehensive meeting information from this email content:\n\n{email_content}\n\nUse all available tools to gather accurate details."
+                    )
+                    return result.data.model_dump()
             
-            extracted_info = result.data.model_dump()
-            print(f"🤖 Agent extracted: {extracted_info}")
-            return extracted_info
+            # Execute the extraction
+            try:
+                # Check if we're already in an async context
+                loop = None
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                
+                if loop is not None:
+                    # We're in an async context, create a task
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, run_extraction())
+                        extracted_info = future.result(timeout=10)
+                else:
+                    # Not in an async context, safe to use asyncio.run
+                    extracted_info = asyncio.run(run_extraction())
+                
+                print(f"🤖 Agentic extraction complete: {extracted_info}")
+                return extracted_info
+                
+            except Exception as async_error:
+                print(f"⚠️ Async extraction failed: {async_error}")
+                # Try sync fallback if available
+                try:
+                    print("🔄 Attempting sync extraction...")
+                    sync_agent = Agent(
+                        model=self.agent_model,
+                        result_type=MeetingInfo,
+                        tools=[extract_duration_from_text, extract_time_preference, extract_urgency_level, extract_meeting_type],
+                        system_prompt="Extract meeting information from email content. Be concise and accurate."
+                    )
+                    
+                    # Use run_sync for synchronous execution
+                    result = sync_agent.run_sync(
+                        f"Extract meeting information from this email:\n\n{email_content}"
+                    )
+                    
+                    extracted_info = result.data.model_dump()
+                    print(f"🤖 Sync agent extracted: {extracted_info}")
+                    return extracted_info
+                    
+                except Exception as sync_error:
+                    print(f"⚠️ Sync extraction also failed: {sync_error}")
+                    return self._extract_meeting_info_traditional(email_content)
             
         except Exception as e:
-            print(f"⚠️ Agent extraction failed: {e}")
+            print(f"⚠️ Agentic extraction setup failed: {e}")
             return self._extract_meeting_info_traditional(email_content)
     
     def _extract_meeting_info_traditional(self, email_content: str) -> Dict[str, Any]:
-        """Traditional LLM-based extraction as fallback."""
-        # Original extraction logic
-        prompt = f"""Extract meeting information from this email and return a JSON object:
+        """Enhanced traditional extraction with comprehensive pattern matching."""
+        
+        def extract_duration(text: str) -> int:
+            """Extract duration with advanced pattern matching."""
+            duration_patterns = [
+                (r'(\d+)\s*hours?', lambda x: int(x) * 60),
+                (r'(\d+)\s*hrs?', lambda x: int(x) * 60),
+                (r'(\d+)\s*minutes?', lambda x: int(x)),
+                (r'(\d+)\s*mins?', lambda x: int(x)),
+                (r'half\s*hour', lambda x: 30),
+                (r'quarter\s*hour', lambda x: 15),
+                (r'1\.5\s*hours?', lambda x: 90),
+                (r'two\s*hours?', lambda x: 120),
+                (r'one\s*hour', lambda x: 60),
+                (r'thirty\s*minutes?', lambda x: 30),
+                (r'fifteen\s*minutes?', lambda x: 15),
+            ]
+            
+            for pattern, converter in duration_patterns:
+                match = re.search(pattern, text.lower())
+                if match:
+                    if pattern in [r'half\s*hour', r'quarter\s*hour', r'1\.5\s*hours?', 
+                                   r'two\s*hours?', r'one\s*hour', r'thirty\s*minutes?', r'fifteen\s*minutes?']:
+                        return converter(None)
+                    else:
+                        return converter(match.group(1))
+            
+            # Meeting type-based duration estimation
+            text_lower = text.lower()
+            if any(word in text_lower for word in ['standup', 'daily', 'scrum', 'check-in']):
+                return 15
+            elif any(word in text_lower for word in ['interview', 'screening']):
+                return 45
+            elif any(word in text_lower for word in ['workshop', 'training', 'session']):
+                return 120
+            elif any(word in text_lower for word in ['quick', 'brief', 'short']):
+                return 30
+            elif any(word in text_lower for word in ['long', 'detailed', 'comprehensive']):
+                return 90
+            
+            return 60  # Default
+        
+        def extract_time_preference(text: str) -> str:
+            """Extract time preference with comprehensive patterns."""
+            text_lower = text.lower()
+            
+            # Specific time mentions
+            if re.search(r'\b(9|10|11)\s*(am|a\.m\.)', text_lower):
+                return "morning"
+            elif re.search(r'\b(12|1|2|3|4)\s*(pm|p\.m\.)', text_lower):
+                return "afternoon"
+            elif re.search(r'\b(5|6|7)\s*(pm|p\.m\.)', text_lower):
+                return "evening"
+            
+            # General time preferences
+            morning_words = ['morning', 'early', 'start of day', 'beginning', 'am']
+            afternoon_words = ['afternoon', 'midday', 'lunch time', 'post lunch', 'pm']
+            evening_words = ['evening', 'end of day', 'eod', 'late', 'after hours']
+            flexible_words = ['flexible', 'anytime', 'convenient', 'whenever', 'open']
+            
+            if any(word in text_lower for word in morning_words):
+                return "morning"
+            elif any(word in text_lower for word in afternoon_words):
+                return "afternoon"
+            elif any(word in text_lower for word in evening_words):
+                return "evening"
+            elif any(word in text_lower for word in flexible_words):
+                return "anytime"
+            
+            # Day-specific preferences
+            days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            for day in days:
+                if day in text_lower:
+                    return day
+            
+            return "anytime"
+        
+        def extract_urgency(text: str) -> str:
+            """Extract urgency level with comprehensive patterns."""
+            text_lower = text.lower()
+            
+            high_urgency = ['urgent', 'asap', 'immediately', 'emergency', 'critical', 
+                           'priority', 'rush', 'today', 'now', 'must', 'need to discuss']
+            low_urgency = ['flexible', 'whenever', 'no rush', 'convenient', 'eventually',
+                          'when available', 'leisure', 'no hurry', 'relaxed', 'casual']
+            medium_urgency = ['soon', 'this week', 'important', 'needed', 'required',
+                             'timely', 'prompt', 'next week']
+            
+            # Check for explicit low urgency first (more specific)
+            if any(word in text_lower for word in low_urgency):
+                return "low"
+            elif any(word in text_lower for word in high_urgency):
+                return "high"
+            elif any(word in text_lower for word in medium_urgency):
+                return "medium"
+            
+            return "medium"  # Default
+        
+        def extract_meeting_type(text: str) -> str:
+            """Extract meeting type with comprehensive patterns."""
+            text_lower = text.lower()
+            
+            # Team meeting indicators
+            team_words = ['team', 'standup', 'scrum', 'sprint', 'retrospective', 
+                         'all hands', 'staff', 'department']
+            
+            # Client/external indicators  
+            client_words = ['client', 'customer', 'external', 'demo', 'sales',
+                           'prospect', 'vendor', 'partner']
+            
+            # Interview indicators
+            interview_words = ['interview', 'candidate', 'hiring', 'screening',
+                              'recruitment', 'onboarding']
+            
+            # Presentation indicators
+            presentation_words = ['presentation', 'demo', 'showcase', 'review',
+                                 'pitch', 'proposal', 'walkthrough']
+            
+            # Planning indicators
+            planning_words = ['planning', 'strategy', 'roadmap', 'brainstorm',
+                             'ideation', 'design', 'architecture']
+            
+            if any(word in text_lower for word in team_words):
+                return "team_meeting"
+            elif any(word in text_lower for word in client_words):
+                return "client_call"
+            elif any(word in text_lower for word in interview_words):
+                return "interview"
+            elif any(word in text_lower for word in presentation_words):
+                return "presentation"
+            elif any(word in text_lower for word in planning_words):
+                return "planning"
+            
+            return "other"
+        
+        # Extract information using enhanced pattern matching
+        extracted_info = {
+            "meeting_duration_minutes": extract_duration(email_content),
+            "time_preference": extract_time_preference(email_content),
+            "urgency": extract_urgency(email_content),
+            "meeting_type": extract_meeting_type(email_content)
+        }
+        
+        # Try LLM extraction if available
+        try:
+            prompt = f"""Extract meeting information from this email and return ONLY a JSON object:
 
 Email: {email_content}
 
-Return JSON with these fields:
-- meeting_duration_minutes (int): Duration in minutes, default 60
-- time_preference (str): "morning", "afternoon", "evening", or "anytime"  
-- urgency (str): "high", "medium", or "low"
-- meeting_type (str): "team_meeting", "client_call", "interview", "presentation", or "other"
+Return JSON with exactly these fields:
+{{"meeting_duration_minutes": {extracted_info['meeting_duration_minutes']}, "time_preference": "{extracted_info['time_preference']}", "urgency": "{extracted_info['urgency']}", "meeting_type": "{extracted_info['meeting_type']}"}}
 
-JSON:"""
+Improve the values if the email contains more specific information. Return only the JSON:"""
 
-        try:
             response = requests.post(f"{self.vllm_url}/completions", 
                 json={
                     "model": self.model_name,
                     "prompt": prompt,
-                    "max_tokens": 200,
+                    "max_tokens": 150,
                     "temperature": 0.1
                 },
-                timeout=10
+                timeout=5
             )
             
             if response.status_code == 200:
                 result = response.json()['choices'][0]['text'].strip()
-                # Parse JSON from response
                 import json
                 try:
-                    meeting_info = json.loads(result)
-                    return meeting_info
-                except:
-                    # Fallback to manual parsing
-                    pass
-        except:
-            pass
+                    llm_info = json.loads(result)
+                    # Merge LLM results with pattern-based extraction
+                    extracted_info.update(llm_info)
+                except Exception as e:
+                    print(f"LLM JSON parsing failed: {e}")
+                    
+        except Exception as e:
+            print(f"LLM extraction failed: {e}")
         
-        # Ultimate fallback - basic extraction
-        return {
-            "meeting_duration_minutes": 60,
-            "time_preference": "anytime",
-            "urgency": "medium", 
-            "meeting_type": "other"
-        }
+        print(f"📊 Traditional extraction result: {extracted_info}")
+        return extracted_info
     
     def _fallback_parse(self, email_content: str, subject: str) -> Dict:
         """Fallback parsing without LLM"""
@@ -386,9 +710,28 @@ JSON:"""
             return self._get_mock_calendar_events(email, start_date, end_date)
         
         try:
+            # Clean and validate date format
+            def clean_date(date_str: str) -> str:
+                """Ensure date is in YYYY-MM-DD format"""
+                try:
+                    # If it's already a datetime string, extract just the date part
+                    if 'T' in date_str:
+                        date_str = date_str.split('T')[0]
+                    
+                    # Parse and reformat to ensure correct format
+                    parsed_date = date_parser.parse(date_str).date()
+                    return parsed_date.isoformat()  # Returns YYYY-MM-DD
+                except Exception as e:
+                    print(f"Date parsing error for {date_str}: {e}")
+                    # Fallback to current date
+                    return datetime.now().date().isoformat()
+            
+            clean_start = clean_date(start_date)
+            clean_end = clean_date(end_date)
+            
             # Convert dates to proper format for Google Calendar API
-            start_datetime = f"{start_date}T00:00:00+05:30"  # IST timezone
-            end_datetime = f"{end_date}T23:59:59+05:30"     # IST timezone
+            start_datetime = f"{clean_start}T00:00:00+05:30"  # IST timezone
+            end_datetime = f"{clean_end}T23:59:59+05:30"     # IST timezone
             
             return self._retrieve_calendar_events(email, start_datetime, end_datetime)
         except Exception as e:
@@ -739,6 +1082,17 @@ JSON:"""
                 event_start = date_parser.parse(event['StartTime'])
                 event_end = date_parser.parse(event['EndTime'])
                 
+                # Ensure both datetimes are timezone-aware for comparison
+                if event_start.tzinfo is None:
+                    event_start = self.timezone.localize(event_start)
+                else:
+                    event_start = event_start.astimezone(self.timezone)
+                
+                if event_end.tzinfo is None:
+                    event_end = self.timezone.localize(event_end)
+                else:
+                    event_end = event_end.astimezone(self.timezone)
+                
                 # Check overlap
                 if slot_start < event_end and slot_end > event_start:
                     return True
@@ -843,6 +1197,23 @@ JSON:"""
             for event in events:
                 event_start = date_parser.parse(event['StartTime'])
                 event_end = date_parser.parse(event['EndTime'])
+                
+                # Ensure timezone consistency for comparison
+                if event_start.tzinfo is None:
+                    event_start = self.timezone.localize(event_start)
+                else:
+                    event_start = event_start.astimezone(self.timezone)
+                
+                if event_end.tzinfo is None:
+                    event_end = self.timezone.localize(event_end)
+                else:
+                    event_end = event_end.astimezone(self.timezone)
+                
+                # Ensure slot times are timezone-aware
+                if slot_start.tzinfo is None:
+                    slot_start = self.timezone.localize(slot_start)
+                if slot_end.tzinfo is None:
+                    slot_end = self.timezone.localize(slot_end)
                 
                 # Check for overlap
                 if (slot_start < event_end and slot_end > event_start):
@@ -960,11 +1331,17 @@ JSON:"""
             
             # Find optimal meeting slot using OR-based optimization
             print("🔍 Finding optimal meeting slot...")
+            
+            # Get start date - ensure proper format (YYYY-MM-DD)
+            start_date = input_data.get('Datetime', datetime.now(self.timezone).date().isoformat())
+            if 'T' in start_date:  # Handle full datetime strings
+                start_date = start_date.split('T')[0]
+            
             start_time, end_time = self.find_optimal_slot(
                 attendee_emails,
                 parsed_info.get('meeting_duration_minutes', 60),
                 parsed_info.get('time_preference', 'anytime'),
-                input_data.get('Datetime', datetime.now(self.timezone).isoformat())
+                start_date
             )
             
             print(f"⏰ Optimal slot found: {start_time} to {end_time}")
