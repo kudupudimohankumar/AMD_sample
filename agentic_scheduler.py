@@ -17,6 +17,15 @@ from typing import Dict, List, Tuple, Optional
 from dateutil import parser as date_parser
 import pytz
 
+# Google Calendar API imports
+try:
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    GOOGLE_CALENDAR_AVAILABLE = True
+except ImportError:
+    GOOGLE_CALENDAR_AVAILABLE = False
+    print("Warning: Google Calendar API not available. Using mock data.")
+
 class AgenticScheduler:
     def __init__(self, vllm_url: str = "http://localhost:3000/v1", model_name: str = "/home/user/Models/deepseek-ai/deepseek-llm-7b-chat"):
         """
@@ -131,25 +140,103 @@ class AgenticScheduler:
     
     def get_calendar_events(self, email: str, start_date: str, end_date: str) -> List[Dict]:
         """
-        Mock function to get calendar events for an attendee
-        In a real implementation, this would call Google Calendar API
+        Retrieve calendar events for an attendee using Google Calendar API
         
         Args:
             email: Attendee email
-            start_date: Start date for search
-            end_date: End date for search
+            start_date: Start date for search (YYYY-MM-DD format)
+            end_date: End date for search (YYYY-MM-DD format)
             
         Returns:
             List of calendar events
         """
-        # This is a mock implementation
-        # In real scenario, you would use Google Calendar API with OAuth tokens
+        if not GOOGLE_CALENDAR_AVAILABLE:
+            return self._get_mock_calendar_events(email, start_date, end_date)
         
+        try:
+            # Convert dates to proper format for Google Calendar API
+            start_datetime = f"{start_date}T00:00:00+05:30"  # IST timezone
+            end_datetime = f"{end_date}T23:59:59+05:30"     # IST timezone
+            
+            return self._retrieve_calendar_events(email, start_datetime, end_datetime)
+        except Exception as e:
+            print(f"Error fetching calendar events for {email}: {e}")
+            return self._get_mock_calendar_events(email, start_date, end_date)
+    
+    def _retrieve_calendar_events(self, user: str, start: str, end: str) -> List[Dict]:
+        """
+        Implementation of the Google Calendar event retrieval function
+        Based on the provided calendar fetcher code
+        """
+        events_list = []
+        
+        try:
+            # Build token path based on user email
+            token_path = f"Keys/{user.split('@')[0]}.token"
+            
+            # Load user credentials from token file
+            user_creds = Credentials.from_authorized_user_file(token_path)
+            
+            # Build calendar service
+            calendar_service = build("calendar", "v3", credentials=user_creds)
+            
+            # Fetch events from Google Calendar API
+            events_result = calendar_service.events().list(
+                calendarId='primary',
+                timeMin=start,
+                timeMax=end,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            
+            events = events_result.get('items', [])
+            
+            # Process each event
+            for event in events:
+                attendee_list = []
+                try:
+                    # Extract attendees if available
+                    if "attendees" in event:
+                        for attendee in event["attendees"]:
+                            attendee_list.append(attendee['email'])
+                    else:
+                        attendee_list.append("SELF")
+                except Exception:
+                    attendee_list.append("SELF")
+                
+                # Extract start and end times
+                start_time = event["start"].get("dateTime", event["start"].get("date"))
+                end_time = event["end"].get("dateTime", event["end"].get("date"))
+                
+                # Create event dictionary in the required format
+                events_list.append({
+                    "StartTime": start_time,
+                    "EndTime": end_time,
+                    "NumAttendees": len(set(attendee_list)),
+                    "Attendees": list(set(attendee_list)),
+                    "Summary": event.get("summary", "No title")
+                })
+                
+        except FileNotFoundError:
+            print(f"Token file not found for user {user}. Using mock data.")
+            return self._get_mock_calendar_events(user, start.split('T')[0], end.split('T')[0])
+        except Exception as e:
+            print(f"Error accessing Google Calendar for {user}: {e}")
+            return self._get_mock_calendar_events(user, start.split('T')[0], end.split('T')[0])
+        
+        return events_list
+    
+    def _get_mock_calendar_events(self, email: str, start_date: str, end_date: str) -> List[Dict]:
+        """
+        Fallback mock calendar events when Google Calendar API is not available
+        """
         mock_events = {
             "userone.amd@gmail.com": [
                 {
                     "StartTime": "2025-07-24T09:00:00+05:30",
                     "EndTime": "2025-07-24T10:00:00+05:30",
+                    "NumAttendees": 1,
+                    "Attendees": ["userone.amd@gmail.com"],
                     "Summary": "Morning Standup"
                 }
             ],
@@ -157,11 +244,15 @@ class AgenticScheduler:
                 {
                     "StartTime": "2025-07-24T10:00:00+05:30",
                     "EndTime": "2025-07-24T10:30:00+05:30",
+                    "NumAttendees": 3,
+                    "Attendees": ["userone.amd@gmail.com", "usertwo.amd@gmail.com", "userthree.amd@gmail.com"],
                     "Summary": "Team Meet"
                 },
                 {
                     "StartTime": "2025-07-24T14:00:00+05:30",
                     "EndTime": "2025-07-24T15:00:00+05:30",
+                    "NumAttendees": 1,
+                    "Attendees": ["usertwo.amd@gmail.com"],
                     "Summary": "Client Call"
                 }
             ],
@@ -169,11 +260,15 @@ class AgenticScheduler:
                 {
                     "StartTime": "2025-07-24T10:00:00+05:30",
                     "EndTime": "2025-07-24T10:30:00+05:30",
+                    "NumAttendees": 3,
+                    "Attendees": ["userone.amd@gmail.com", "usertwo.amd@gmail.com", "userthree.amd@gmail.com"],
                     "Summary": "Team Meet"
                 },
                 {
                     "StartTime": "2025-07-24T13:00:00+05:30",
                     "EndTime": "2025-07-24T14:00:00+05:30",
+                    "NumAttendees": 1,
+                    "Attendees": ["SELF"],
                     "Summary": "Lunch with Customers"
                 }
             ]
