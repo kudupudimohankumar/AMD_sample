@@ -1,0 +1,24 @@
+# Agentic AI Scheduling Assistant Requirements
+# AMD Hackathon 2025
+
+# Core dependencies
+flask>=2.0.0
+requests>=2.25.0
+python-dateutil>=2.8.0
+pytz>=2021.1
+
+# Optional dependencies for enhanced functionality
+numpy>=1.21.0
+pandas>=1.3.0
+
+# For Google Calendar API integration (when using real calendar data)
+google-auth>=2.0.0
+google-auth-oauthlib>=0.5.0
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+
+# For improved date/time parsing
+dateparser>=1.1.0
+
+# For better error handling and logging
+colorlog>=6.0.0
