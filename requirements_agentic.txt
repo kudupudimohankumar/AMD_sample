@@ -1,0 +1,39 @@
+# Agentic AI Scheduling Assistant - Enhanced Requirements
+# For AMD Hackathon 2025
+
+# Core Dependencies
+flask==3.0.0
+python-dateutil==2.8.2
+pytz==2023.3
+requests==2.31.0
+
+# Google Calendar Integration
+google-auth==2.23.4
+google-auth-oauthlib==1.1.0
+google-auth-httplib2==0.1.1
+google-api-python-client==2.108.0
+
+# OR-Tools for Optimization
+ortools==9.8.3296
+
+# Agentic AI Framework
+pydantic-ai==0.0.13
+pydantic==2.5.0
+
+# MCP (Model Context Protocol) Support
+mcp==1.0.0
+
+# Optional AI/ML enhancements
+numpy==1.24.3
+scipy==1.11.4
+
+# Development and Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+
+# Logging and monitoring
+structlog==23.2.0
+
+# Additional utilities
+tenacity==8.2.3  # For retry logic
+asyncio-throttle==1.0.2  # For rate limiting

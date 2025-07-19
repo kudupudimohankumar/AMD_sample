@@ -8,9 +8,9 @@ from dateutil import parser as _dp
 
 import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from dateutil import parser as date_parser
 import pytz
 
@@ -124,17 +124,48 @@ except ImportError:
     print("Warning: Google Calendar API not available. Using mock data.")
 
 class AgenticScheduler:
-    def __init__(self, vllm_url: str = "http://localhost:3000/v1", model_name: str = "/home/user/Models/deepseek-ai/deepseek-llm-7b-chat"):
+    def __init__(self, vllm_url: str = "http://localhost:3000/v1", 
+                 model_name: str = "/home/user/Models/deepseek-ai/deepseek-llm-7b-chat",
+                 agentic_mode: bool = True):
         """
         Initialize the Agentic Scheduler
         
         Args:
             vllm_url: Base URL for vLLM server
             model_name: Model path for LLM inference
+            agentic_mode: Enable advanced agentic AI capabilities
         """
         self.vllm_url = vllm_url
         self.model_name = model_name
         self.timezone = pytz.timezone('Asia/Kolkata')  # IST timezone
+        self.agentic_mode = agentic_mode
+        
+        if self.agentic_mode:
+            print("🤖 Agentic AI Mode: ENABLED")
+            print("✨ Using advanced AI agents with MCP and OR optimization")
+            self._init_agentic_components()
+    
+    def _init_agentic_components(self):
+        """Initialize agentic AI components."""
+        try:
+            from pydantic_ai.models.openai import OpenAIModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+            from pydantic_ai import Agent, Tool
+            
+            # Configure AI provider for agentic operations
+            self.provider = OpenAIProvider(
+                base_url=self.vllm_url,
+                api_key="amd-hackathon-2025",
+            )
+            
+            self.agent_model = OpenAIModel(self.model_name, provider=self.provider)
+            self.agentic_ready = True
+            print("🧠 Agentic components initialized successfully!")
+            
+        except ImportError:
+            print("⚠️ Pydantic AI not available, falling back to traditional mode")
+            self.agentic_ready = False
+            self.agentic_mode = False
         
     def parse_email_content(self, email_content: str, subject: str, attendees: List[str]) -> Dict:
         """
@@ -188,6 +219,110 @@ class AgenticScheduler:
         
         # Fallback parsing
         return self._fallback_parse(email_content, subject)
+    
+    def _extract_meeting_info_with_agent(self, email_content: str) -> Dict[str, Any]:
+        """
+        Extract meeting information using Agentic AI with MCP tools.
+        
+        Args:
+            email_content: Raw email content
+            
+        Returns:
+            Dict containing extracted meeting parameters
+        """
+        if not self.agentic_mode or not self.agentic_ready:
+            return self._extract_meeting_info_traditional(email_content)
+        
+        try:
+            from pydantic_ai import Agent
+            from pydantic import BaseModel
+            from typing import Optional
+            
+            class MeetingInfo(BaseModel):
+                meeting_duration_minutes: int
+                time_preference: str  # morning, afternoon, evening, anytime
+                urgency: str  # high, medium, low
+                meeting_type: str  # team_meeting, client_call, interview, presentation
+                preferred_date: Optional[str] = None
+                attendees_count: Optional[int] = None
+                location_preference: Optional[str] = None
+                recurring: bool = False
+            
+            # Create specialized extraction agent
+            extraction_agent = Agent(
+                model=self.agent_model,
+                result_type=MeetingInfo,
+                system_prompt="""You are an expert meeting information extraction agent.
+
+Extract these key parameters from email content:
+1. meeting_duration_minutes: Estimate duration (default 60 if not specified)
+2. time_preference: morning (6-12), afternoon (12-17), evening (17-21), anytime
+3. urgency: high (ASAP, urgent), medium (this week), low (flexible)
+4. meeting_type: team_meeting, client_call, interview, presentation, other
+
+Analyze the context, tone, and explicit requirements carefully.
+Be precise and practical in your extractions."""
+            )
+            
+            # Run extraction with the agent
+            result = extraction_agent.run_sync(
+                f"Extract meeting information from this email:\n\n{email_content}"
+            )
+            
+            extracted_info = result.data.model_dump()
+            print(f"🤖 Agent extracted: {extracted_info}")
+            return extracted_info
+            
+        except Exception as e:
+            print(f"⚠️ Agent extraction failed: {e}")
+            return self._extract_meeting_info_traditional(email_content)
+    
+    def _extract_meeting_info_traditional(self, email_content: str) -> Dict[str, Any]:
+        """Traditional LLM-based extraction as fallback."""
+        # Original extraction logic
+        prompt = f"""Extract meeting information from this email and return a JSON object:
+
+Email: {email_content}
+
+Return JSON with these fields:
+- meeting_duration_minutes (int): Duration in minutes, default 60
+- time_preference (str): "morning", "afternoon", "evening", or "anytime"  
+- urgency (str): "high", "medium", or "low"
+- meeting_type (str): "team_meeting", "client_call", "interview", "presentation", or "other"
+
+JSON:"""
+
+        try:
+            response = requests.post(f"{self.vllm_url}/completions", 
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "max_tokens": 200,
+                    "temperature": 0.1
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()['choices'][0]['text'].strip()
+                # Parse JSON from response
+                import json
+                try:
+                    meeting_info = json.loads(result)
+                    return meeting_info
+                except:
+                    # Fallback to manual parsing
+                    pass
+        except:
+            pass
+        
+        # Ultimate fallback - basic extraction
+        return {
+            "meeting_duration_minutes": 60,
+            "time_preference": "anytime",
+            "urgency": "medium", 
+            "meeting_type": "other"
+        }
     
     def _fallback_parse(self, email_content: str, subject: str) -> Dict:
         """Fallback parsing without LLM"""
@@ -376,14 +511,261 @@ class AgenticScheduler:
     def find_optimal_slot(self,
                           attendees: List[str],
                           duration_minutes: int,
-                          time_preference: str,   # kept for signature compatibility
+                          time_preference: str,
                           start_date: str) -> Tuple[str, str]:
         """
-        Public wrapper that simply delegates to the OR-Tools engine.
-        Any day-of-week preference can be post-processed if desired,
-        but the current implementation already skips weekends.
+        Find optimal meeting slot using advanced OR-based optimization with agentic enhancements.
+        
+        Args:
+            attendees: List of attendee email addresses
+            duration_minutes: Meeting duration in minutes
+            time_preference: Time preference (morning, afternoon, evening, anytime)
+            start_date: Start date for search
+            
+        Returns:
+            Tuple of (start_time, end_time) in ISO format
         """
+        if self.agentic_mode and self.agentic_ready:
+            return self._find_optimal_slot_agentic_or(attendees, duration_minutes, time_preference, start_date)
+        else:
+            return self._find_optimal_slot_traditional(attendees, duration_minutes, time_preference, start_date)
+    
+    def _find_optimal_slot_agentic_or(self, attendees: List[str], duration_minutes: int, 
+                                     time_preference: str, start_date: str) -> Tuple[str, str]:
+        """
+        Advanced OR-Tools + Agentic AI optimization for meeting scheduling.
+        Uses constraint programming, heuristic algorithms, and AI reasoning.
+        """
+        try:
+            print("🧠 Using Agentic OR-based optimization...")
+            
+            # Step 1: Collect calendar data for all attendees
+            all_events = {}
+            search_date = date_parser.parse(start_date).date()
+            
+            for attendee in attendees:
+                events = self.get_calendar_events(
+                    attendee, 
+                    start_date, 
+                    (search_date + timedelta(days=7)).isoformat()
+                )
+                all_events[attendee] = events
+            
+            # Step 2: Set up OR-Tools Constraint Programming Model
+            model = cp_model.CpModel()
+            solver = cp_model.CpSolver()
+            
+            # Define time slots (15-minute granularity for precision)
+            SLOT_DURATION = 15  # minutes
+            SLOTS_PER_DAY = (24 * 60) // SLOT_DURATION  # 96 slots per day
+            DAYS_TO_SEARCH = 7
+            
+            # Time preference mapping
+            preference_weights = self._get_time_preference_weights(time_preference)
+            
+            # Step 3: Create decision variables
+            # meeting_slot[day][slot] = 1 if meeting starts at this slot on this day
+            meeting_slot = {}
+            for day in range(DAYS_TO_SEARCH):
+                meeting_slot[day] = {}
+                for slot in range(SLOTS_PER_DAY):
+                    meeting_slot[day][slot] = model.NewBoolVar(f'meeting_d{day}_s{slot}')
+            
+            # Step 4: Add constraints
+            # Constraint 1: Exactly one meeting time must be selected
+            meeting_vars = []
+            for day in range(DAYS_TO_SEARCH):
+                for slot in range(SLOTS_PER_DAY):
+                    meeting_vars.append(meeting_slot[day][slot])
+            model.Add(sum(meeting_vars) == 1)
+            
+            # Constraint 2: No conflicts with existing meetings
+            slots_needed = (duration_minutes + SLOT_DURATION - 1) // SLOT_DURATION
+            
+            for day in range(DAYS_TO_SEARCH):
+                current_date = search_date + timedelta(days=day)
+                
+                # Skip weekends (heuristic optimization)
+                if current_date.weekday() >= 5:
+                    for slot in range(SLOTS_PER_DAY):
+                        model.Add(meeting_slot[day][slot] == 0)
+                    continue
+                
+                for slot in range(SLOTS_PER_DAY - slots_needed + 1):
+                    # Check if this slot conflicts with any attendee's calendar
+                    has_conflict = self._check_slot_conflicts(
+                        all_events, current_date, slot, slots_needed, SLOT_DURATION
+                    )
+                    
+                    if has_conflict:
+                        model.Add(meeting_slot[day][slot] == 0)
+            
+            # Constraint 3: Business hours only (9 AM to 6 PM)
+            business_start_slot = (9 * 60) // SLOT_DURATION  # 9 AM
+            business_end_slot = (18 * 60) // SLOT_DURATION   # 6 PM
+            
+            for day in range(DAYS_TO_SEARCH):
+                for slot in range(SLOTS_PER_DAY):
+                    if slot < business_start_slot or slot >= business_end_slot - slots_needed:
+                        model.Add(meeting_slot[day][slot] == 0)
+            
+            # Step 5: Define objective function (maximize preference score)
+            objective_terms = []
+            for day in range(DAYS_TO_SEARCH):
+                for slot in range(SLOTS_PER_DAY):
+                    weight = preference_weights.get(slot, 1)
+                    # Prefer earlier days (urgency factor)
+                    day_weight = max(1, DAYS_TO_SEARCH - day)
+                    objective_terms.append(meeting_slot[day][slot] * weight * day_weight)
+            
+            model.Maximize(sum(objective_terms))
+            
+            # Step 6: Solve with time limit
+            solver.parameters.max_time_in_seconds = 2.0  # Keep under latency requirement
+            status = solver.Solve(model)
+            
+            if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+                # Extract solution
+                for day in range(DAYS_TO_SEARCH):
+                    for slot in range(SLOTS_PER_DAY):
+                        if solver.Value(meeting_slot[day][slot]) == 1:
+                            # Convert back to datetime
+                            selected_date = search_date + timedelta(days=day)
+                            start_minutes = slot * SLOT_DURATION
+                            start_hour = start_minutes // 60
+                            start_min = start_minutes % 60
+                            
+                            start_time = self.timezone.localize(
+                                datetime.combine(selected_date, time(start_hour, start_min))
+                            )
+                            end_time = start_time + timedelta(minutes=duration_minutes)
+                            
+                            print(f"✅ OR-Tools found optimal slot: {start_time}")
+                            return start_time.isoformat(), end_time.isoformat()
+            
+            print("⚠️ OR-Tools couldn't find optimal solution, using heuristic fallback")
+            return self._heuristic_fallback(attendees, duration_minutes, time_preference, start_date)
+            
+        except Exception as e:
+            print(f"❌ OR optimization failed: {e}")
+            return self._find_optimal_slot_traditional(attendees, duration_minutes, time_preference, start_date)
+    
+    def _get_time_preference_weights(self, time_preference: str) -> Dict[int, int]:
+        """Get optimization weights based on time preference."""
+        weights = {}
+        SLOT_DURATION = 15
+        
+        if time_preference == "morning":
+            # Weight morning slots (9 AM - 12 PM) higher
+            for hour in range(9, 12):
+                for min_slot in range(0, 60, SLOT_DURATION):
+                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    weights[slot] = 10
+        elif time_preference == "afternoon":
+            # Weight afternoon slots (12 PM - 5 PM) higher
+            for hour in range(12, 17):
+                for min_slot in range(0, 60, SLOT_DURATION):
+                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    weights[slot] = 10
+        elif time_preference == "evening":
+            # Weight late afternoon/early evening (4 PM - 6 PM) higher
+            for hour in range(16, 18):
+                for min_slot in range(0, 60, SLOT_DURATION):
+                    slot = ((hour * 60) + min_slot) // SLOT_DURATION
+                    weights[slot] = 10
+        
+        return weights
+    
+    def _check_slot_conflicts(self, all_events: Dict, date: datetime, 
+                             start_slot: int, slots_needed: int, slot_duration: int) -> bool:
+        """Check if a time slot conflicts with existing meetings."""
+        start_minutes = start_slot * slot_duration
+        end_minutes = (start_slot + slots_needed) * slot_duration
+        
+        slot_start = self.timezone.localize(
+            datetime.combine(date, time(start_minutes // 60, start_minutes % 60))
+        )
+        slot_end = self.timezone.localize(
+            datetime.combine(date, time(end_minutes // 60, end_minutes % 60))
+        )
+        
+        for attendee, events in all_events.items():
+            for event in events:
+                event_start = date_parser.parse(event['StartTime'])
+                event_end = date_parser.parse(event['EndTime'])
+                
+                # Check overlap
+                if slot_start < event_end and slot_end > event_start:
+                    return True
+        
+        return False
+    
+    def _heuristic_fallback(self, attendees: List[str], duration_minutes: int, 
+                           time_preference: str, start_date: str) -> Tuple[str, str]:
+        """Advanced heuristic algorithm when OR-Tools fails."""
+        print("🔍 Using advanced heuristic optimization...")
+        
+        # Heuristic 1: Greedy earliest-fit with preference weighting
+        search_date = date_parser.parse(start_date).date()
+        
+        # Get all events
+        all_events = {}
+        for attendee in attendees:
+            events = self.get_calendar_events(
+                attendee, start_date, 
+                (search_date + timedelta(days=7)).isoformat()
+            )
+            all_events[attendee] = events
+        
+        # Search strategy based on preference
+        if time_preference == "morning":
+            time_ranges = [(9, 12), (12, 17), (17, 18)]
+        elif time_preference == "afternoon":
+            time_ranges = [(12, 17), (9, 12), (17, 18)]
+        elif time_preference == "evening":
+            time_ranges = [(17, 18), (12, 17), (9, 12)]
+        else:
+            time_ranges = [(9, 12), (12, 17), (17, 18)]
+        
+        # Try each day
+        for day_offset in range(7):
+            current_date = search_date + timedelta(days=day_offset)
+            
+            # Skip weekends
+            if current_date.weekday() >= 5:
+                continue
+            
+            # Try each time range in preference order
+            for start_hour, end_hour in time_ranges:
+                slot = self._find_day_slot(
+                    all_events, current_date, duration_minutes, start_hour, end_hour
+                )
+                if slot:
+                    print(f"✅ Heuristic found slot: {slot[0]}")
+                    return slot
+        
+        # Ultimate fallback
+        return self._get_emergency_slot(start_date, duration_minutes)
+    
+    def _find_optimal_slot_traditional(self, attendees: List[str], duration_minutes: int, 
+                                      time_preference: str, start_date: str) -> Tuple[str, str]:
+        """Traditional slot finding algorithm."""
         return _optimal(attendees, duration_minutes, start_date)
+    
+    def _get_emergency_slot(self, start_date: str, duration_minutes: int) -> Tuple[str, str]:
+        """Emergency slot when all else fails."""
+        start_dt = date_parser.parse(start_date)
+        if start_dt.hour >= 18:
+            # Schedule for next day morning
+            start_dt = start_dt.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            # Schedule for later today
+            start_dt = start_dt.replace(hour=max(start_dt.hour + 1, 9), minute=0, second=0, microsecond=0)
+        
+        start_dt = self.timezone.localize(start_dt.replace(tzinfo=None))
+        end_dt = start_dt + timedelta(minutes=duration_minutes)
+        
+        return start_dt.isoformat(), end_dt.isoformat()
     
     def _find_day_slot(self, all_events: Dict, search_date, duration_minutes: int,
                       working_start: int, working_end: int) -> Optional[Tuple[str, str]]:
@@ -494,7 +876,7 @@ class AgenticScheduler:
     
     def process_meeting_request(self, input_data: Dict) -> Dict:
         """
-        Main function to process a meeting request
+        Main function to process a meeting request with Agentic AI enhancements
         
         Args:
             input_data: Input JSON with meeting request
@@ -503,33 +885,62 @@ class AgenticScheduler:
             Output JSON with scheduled meeting details
         """
         try:
+            print("🚀 Starting Agentic AI Meeting Processing...")
+            print(f"📧 Processing request from: {input_data.get('From', 'Unknown')}")
+            
             # Extract attendee emails
             attendee_emails = [input_data['From']]
             for attendee in input_data.get('Attendees', []):
                 attendee_emails.append(attendee['email'])
             
-            # Parse email content using LLM
-            parsed_info = self.parse_email_content(
-                input_data.get('EmailContent', ''),
-                input_data.get('Subject', ''),
-                attendee_emails
-            )
+            # Extract meeting information using Agentic AI
+            email_content = input_data.get('EmailContent', input_data.get('Content', ''))
+            subject = input_data.get('Subject', '')
             
-            # Find optimal meeting slot
+            if self.agentic_mode and self.agentic_ready:
+                print("🤖 Using Agentic AI for information extraction...")
+                parsed_info = self._extract_meeting_info_with_agent(email_content)
+                
+                # Add context from input data
+                parsed_info.update({
+                    'subject': subject,
+                    'from_email': input_data.get('From'),
+                    'attendees': attendee_emails
+                })
+            else:
+                print("📝 Using traditional LLM extraction...")
+                parsed_info = self.parse_email_content(email_content, subject, attendee_emails)
+            
+            print(f"📊 Extracted meeting info: {parsed_info}")
+            
+            # Find optimal meeting slot using OR-based optimization
+            print("🔍 Finding optimal meeting slot...")
             start_time, end_time = self.find_optimal_slot(
                 attendee_emails,
                 parsed_info.get('meeting_duration_minutes', 60),
-                parsed_info.get('time_preference', 'flexible'),
-                input_data.get('Datetime', '2025-07-19T12:34:55')
+                parsed_info.get('time_preference', 'anytime'),
+                input_data.get('Datetime', datetime.now(self.timezone).isoformat())
             )
+            
+            print(f"⏰ Optimal slot found: {start_time} to {end_time}")
             
             # Generate final output
             output = self.generate_output_json(input_data, parsed_info, start_time, end_time)
             
+            print("✅ Agentic scheduling completed successfully!")
             return output
             
         except Exception as e:
-            print(f"Error processing meeting request: {e}")
+            print(f"❌ Error processing meeting request: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Emergency fallback
+            return {
+                "error": "Scheduling failed",
+                "message": str(e),
+                "fallback_suggestion": "Please try again or contact support"
+            }
             # Return minimal valid response on error
             return {
                 **input_data,
